@@ -1,0 +1,726 @@
+---
+title: "Earthquake Classification Methods Project"
+author: "Benjamin Feciura"
+date: "`r format(Sys.Date(), '%b %d, %Y')`"
+output:
+  html_document:
+    number_sections: true    
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: espresso    
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(error=TRUE,        # Keep compiling upon error
+                      collapse=FALSE,    # collapse by default
+                      echo=TRUE,         # echo code by default
+                      comment = "#>",    # change comment character
+                      fig.width = 5.5,     # set figure width
+                      fig.align = "center",# set figure position
+                      out.width = "49%", # set width of displayed images
+                      warning=TRUE,      # show R warnings
+                      message=TRUE)      # show R messages
+```
+
+<!--- Change font sizes (or other css modifications) --->
+<style>
+h1.title {
+  font-size: 2.2em; /* Title font size */
+}
+h1 {
+  font-size: 2em;   /* Header 1 font size */
+}
+h2 {
+  font-size: 1.5em;
+}
+h3 { 
+  font-size: 1.2em;
+}
+pre {
+  font-size: 0.8em;  /* Code and R output font size */
+}
+</style>
+
+*******************************************
+
+# Introduction 
+
+This is an academic project conducted as part of my Master's Degree program. It is a practical exercise implementing classification methods using satellite data collected following the 2010 Haitian Earthquake. In the aftermath of the natural disaster, many displaced individuals created temporary shelters using blue tarps which were visible in satellite imagery, the examination of which which ultimately aided responders in locating those in need.
+
+This project focuses on the automation of locating tarps within satellite imagery. The data consists of the RGB color values for 63,241 pixels from these photos, and a variety of algorithms are implemented with the goal of correctly identifying which pixels correspond to blue tarps using this data.
+
+# Training Data / EDA
+
+### Included Packages
+
+```{r load-packages, warning=FALSE, message=FALSE}
+# Load Required Packages
+library(tidyverse)
+library(scales)
+library(pROC)
+library(MASS)
+library(class)
+library(glmnet)
+```
+
+### Response Variable
+
+The response variable for our models will be based on `Class`. Ultimately, I am interested in determining whether or not a pixel represents a Blue Tarp, and not which of the other classes it is a member, so I will create a new binary feature based on this class, but first I would like to learn a bit more about the levels of `Class`.
+
+
+```{r}
+# read in data
+data <- read.csv("HaitiPixels.csv")
+
+# treat Class as a factor
+data$Class <- as.factor(data$Class)
+levels(data$Class)
+```
+
+These levels appear mostly self-explanatory, my assumption for `"Various Non-Tarp"` is that it refers to roads and other structures that are not rooftops.
+
+I think it would be useful to have an idea of the average values (average pixel color) for each class, to aid in an intuitive understanding of the similarities and differences between them. The numerical values of the summary statistics are as follows:
+
+```{r}
+# show numerical values for the ranges and means of each class
+summary(data[data$Class == "Blue Tarp",])
+```
+
+Predictably, the blue values are the highest, on average, for the `"Blue Tarp"` pixels, though the range of values is actually quite wide. The individual pixels with values as low as the minimum (92.0) value among `"Blue Tarp"` pixels may be likely candidates for incorrect classification, though the model will of course classify with more nuance than this cursory analysis on intuition alone.
+
+I would like to visualize the colors, as well. The [`scales` package](https://www.rdocumentation.org/packages/scales/versions/0.4.1/topics/show_col) will be useful.
+
+```{r fig.cap='Top Row: "Blue Tarp", "Rooftop", "Soil"; Bottom Row: "Various Non-Tarp", "Vegetation"'}
+# create a new data frame containing the mean color for each class
+data_summary = data.frame(level = rep("Null", 5), Red = rep(0, 5), Green = rep(0, 5), Blue = rep(0, 5))
+
+for(i in 1:5){
+  data_summary[i,] = c(levels(data$Class)[i], mean(data$Red[data$Class == levels(data$Class)[i]]), mean(data$Green[data$Class == levels(data$Class)[i]]), mean(data$Blue[data$Class == levels(data$Class)[i]]))
+}
+
+# scales::show_col() allows easy plotting of colors based on RGB values
+library(scales)
+
+par(mfrow=c(2,3))
+for(i in 1:5){
+  show_col(rgb(data_summary[i,2], data_summary[i,3], data_summary[i,4],maxColorValue = 255))
+}
+```
+
+This visualization makes clear that the average `"Blue Tarp"` pixel is easy for human eyes to distinguish among the average pixels of other types. I feel the challenge will be classifying outlying observations, like those at the extremes (white pixels, pixels with unusually high or low values for one color).
+
+### Predictors
+
+I will also visualize any relationships between the predictors. Issues with collinearity may require resolution later in the process, and understanding how the values change with one another within the sample space may be useful for my own understanding.
+
+```{r}
+# scatter plots of relationships among the predictors
+par(mfrow=c(2,2), pty = "s")
+plot(data$Red,data$Green, xlab="Red (0 to 255)", ylab="Green (0 to 255)", main = "Red vs. Green Pixel Values")
+plot(data$Red,data$Blue, xlab="Red (0 to 255)", ylab="Blue (0 to 255)", main = "Red vs. Blue Pixel Values")
+plot(data$Green,data$Blue, xlab="Green (0 to 255)", ylab="Blue (0 to 255)", main = "Green vs. Blue Pixel Values")
+```
+
+It would appear that all of the predictors are linearly related with non-constant variance. This makes intuitive sense as changes in value are more significant at higher levels for each color, and brighter colors see all the color values increase together. I would guess that the difference between classes likely lies within this area of greater variance corresponding to higher pixel values. The plots also don't provide any visual evidence for outlying observations.
+
+Aside from these relationships, I have established that the data already exist on the same scale and see no obvious problematic values (no missing values, difficult to make assumptions about outliers). While variable transformations will be explored if necessary, I will begin by including the three existing predictors (`Red`, `Green`, `Blue`) as the factors in each model. With this understanding, I will proceed to modeling.
+
+# Model Training
+
+## Set-up 
+
+### Binary Response Variable
+
+As I am primarily interested in predicting whether or not a pixel is of the `"Blue Tarp"` class, rather than distinguishing among all of the classes, I will create a new binary response variable for use in our models.
+
+```{r}
+# create new variable and set all values to No
+data$IsBlueTarp <- rep("No", nrow(data))
+
+# replace only Blue Tarp values with Yes
+data$IsBlueTarp[data$Class == "Blue Tarp"] <- "Yes"
+data$IsBlueTarp <- as.factor(data$IsBlueTarp)
+```
+
+### Creating $k$ Folds
+
+Using the method described in the class notes, the data will be divided into 10 folds. Additionally, it will be necessary to store the indices for the observations which are a part of each fold so that I can correctly assign the predictions made by each model.
+
+```{r}
+# set random seed
+set.seed(6018)
+
+# split the observations into 10 equally sized folds and add a column to the data indicating to which fold each observation belongs
+data$fold = sample(rep(1:10, length=nrow(data)))
+table(data$fold)
+
+# create empty list
+fold_ids = c()
+# store which row ids correspond to which fold (one list for each fold, all stored within the larger list)
+for(i in 1:10){
+  fold_ids[i] <- list(rownames(data)[data$fold == i])
+}
+```
+
+
+## Logistic Regression
+
+The application of Logistic Regression involves fitting a model which predicts the logit (log odds) of an observation being of a given level of a binary response variable based upon an intercept and a series of predictor variables, in this case of the form:
+$(\textrm{log odds of being Blue Tarp}) = \beta_0 + \beta_1(Red) + \beta_2(Green) + \beta_3(Blue)$
+
+I will not scale or transform the predictors.
+
+The implementation of 10-fold cross-validation will be as follows:
+* before beginning, create empty lists with space for each observation in the full data. These lists will contain the predictions made and posterior probabilities calculated during each iteration, such that in iteration $1$ we will use folds $2$ - $10$ to make predictions about fold $1$, in iteration $2$ we will use folds $1$ and $3$ - $10$ to make predictions about fold $2$, and so on so that by the end of the 10 iterations we will have predictions for every observation in every fold.
+* each iteration, partition the data into training and test sets, using the $i$th fold as the test set and the rest as the training set.
+* fit the logistic regression model using the training data.
+* make predictions about the test data.
+* using the previously noted lists of indices by fold, place the predictions at the proper indices in the lists of predictions and probabilities.
+* evaluate model performance on the full list of predictions.
+
+Note that the equation for the full logistic regression model could be calculated using the average of the regression coefficients for each of the 10 models fit. The full equation will be omitted as I am primarily concerned with making predictions and using the cross-validation performance to determine the overall adequacy of each model type to the problem, rather than creating a particular model.
+
+I will use $0.5$ as the baseline threshold for the model and will validate its performance afterward and use an alterntaive if need be.
+
+```{r warning=FALSE}
+# create empty vector to store our predictions and posterior probabilities
+logistic_predictions <- rep("No", nrow(data))
+logistic_posterior <- rep(0, nrow(data))
+
+# loop over our 10 folds
+for(i in 1:10){
+  # use the ith fold as the test set and the others as the training set
+  logistic_train <- data[data$fold != i,]
+  logistic_test <- data[data$fold == i,]
+
+  # fit a logistic model on the training data
+  logistic_model <- glm(IsBlueTarp ~ Red + Green + Blue, data = logistic_train, family = "binomial")
+  
+  # predict the results for the ith fold (test set) and obtain the posterior probabilities for this iteration using type="response"
+  logistic_probabilities <- predict(logistic_model, newdata = logistic_test, type = "response")
+  
+  # using our list of observations from the set-up phase, look up the index for each observation included in the ith fold and assign the predicted value to the proper index in the full list of predictions 
+  for(j in 1:lengths(fold_ids[i])){
+    # store the posterior probability
+    logistic_posterior[as.numeric(fold_ids[[i]][[j]])] <- logistic_probabilities[j]
+    # if posterior probability greater than threshold (0.5), assign predicted class "Yes"
+    if(logistic_probabilities[j] > 0.5){
+      logistic_predictions[as.numeric(fold_ids[[i]][[j]])] <- "Yes"
+    }
+  }
+}
+
+# compare results to true values
+table(logistic_predictions, data$IsBlueTarp)
+```
+
+The predictions from the logistic regression model resulted in a True Positive Rate of:
+
+$TPR = 1970/(1970+232) = 0.8946412$
+
+a True Negative Rate of:
+
+$TNR = 61153/(61153+66) = 0.9989219$
+
+a Precision of:
+
+$Precision = 1790/(1790+66) = 0.9644397$
+
+and an Accuracy of:
+
+$Accuracy = (61153 + 1790)/63241 = 0.9952879$
+
+Finally, I can plot the ROC curve and calculate AUC. Because the `proc::roc` function requires binary values, I will create an additional column in the data mirroring the values in `IsBlueTarp`, and will do the same for the predictions resulting from the model.
+
+```{r}
+# create a binary version of the response variable ("Yes" = 1, "No" = 0)
+data$IsBlueTarp.Binary <- rep(0, nrow(data))
+data$IsBlueTarp.Binary[data$IsBlueTarp == "Yes"] <- 1
+
+# create a binary version of the predictions
+logistic_predictions.Binary <- rep(0, nrow(data))
+logistic_predictions.Binary[logistic_predictions == "Yes"] <- 1
+```
+
+We can then use these values to produce the ROC curve.
+
+```{r message=FALSE}
+library(pROC)
+
+# plot the curve with the proper labels as described in the class notes. 
+par(pty = "s")
+logistic_roc <- roc(data$IsBlueTarp.Binary, logistic_predictions.Binary, plot = TRUE, legacy.axes=TRUE, xlab="False Positive Rate", ylab="True Postive Rate", col="#377eb8", lwd=4, print.auc=TRUE)
+
+logistic_roc
+```
+
+This ROC is calculated using the predictions from the 10 different fits of the model created above. Though the samples are all part of the full data, each individual prediction was made on data outside the sample used to fit the model, and therefore the data used to create the ROC constitute out-of-sample data.
+
+We can also validate the choice in threshold using `proc::coords()`.
+
+```{r}
+# calculate optimal threshold
+coords(logistic_roc, "best", ret = "threshold")
+```
+
+It appears that 0.5 was the optimal choice in threshold. The logistic regression model appears to have performed generally well, tending more toward False Negatives than toward False Positives. I will discuss the benefits of different approaches when comparing model performance later.
+
+## LDA
+
+Similarly to Logistic Regression, with Linear Discriminant Analysis (LDA) the aim is to produce a probability estimate for the likelihood of an observation belonging to a given class. However, rather than creating a model of the distribution of observations as in Logistic Regression, instead the approach is to model the distributions of each predictor independently and produce probability estimates using Bayes' Theorem.
+
+The implementation of cross-validation will be identical to Logistic Regression. The baseline threshold will be 0.5 (choosing whichever class is more likely).
+
+```{r}
+library(MASS)
+
+# create empty vectors for predictions and probabilities
+lda_predictions <- rep("No", nrow(data))
+lda_posterior <- rep(0, nrow(data))
+
+# iterate through the folds
+for(i in 1:10){
+  # train/test split
+  lda_train <- data[data$fold != i,]
+  lda_test <- data[data$fold == i,]
+
+  # fit model to training data
+  lda_model <- lda(IsBlueTarp ~ Red + Green + Blue, data = lda_train)
+  
+  # predict the probabilities for each class
+  lda_probabilities <- predict(lda_model, lda_test)$posterior
+  
+  # using the appropriate indices for each observation of each fold...
+  for(j in 1:lengths(fold_ids[i])){
+    # store the estimated probability of "Yes"
+    lda_posterior[as.numeric(fold_ids[[i]][[j]])] <- lda_probabilities[j, "Yes"]
+    # assign the correct prediction based on the probability of "Yes"
+    if(lda_probabilities[j, "Yes"] > 0.5){
+      lda_predictions[as.numeric(fold_ids[[i]][[j]])] <- "Yes"
+    }
+  }
+}
+# compare results
+table(lda_predictions, data$IsBlueTarp)
+```
+
+The LDA predictions give a True Positive Rate of:
+
+$TPR = 1620/(1620+402) = 0.8011869$
+
+a True Negative Rate of:
+
+$TNR = 60604/(60604+615) = 0.9899541$
+
+a Precision of:
+
+$Precision = 1620/(1620+615) = 0.7248322$
+
+and an Accuracy of:
+
+$Accuracy = (60604 + 1620)/63241 = 0.9839187$
+
+Plotting the ROC curve and calulating AUC shows:
+
+```{r message=FALSE}
+# create a binary set of predictions
+lda_predictions.Binary <- rep(0, nrow(data))
+lda_predictions.Binary[lda_predictions == "Yes"] <- 1
+
+# plot the ROC
+par(pty = "s")
+lda_roc <- roc(data$IsBlueTarp.Binary, lda_predictions.Binary, plot = TRUE, legacy.axes=TRUE, xlab="False Positive Rate", ylab="True Postive Rate", col="#377eb8", lwd=4, print.auc=TRUE)
+
+lda_roc
+```
+
+```{r}
+coords(lda_roc, "best", ret = "threshold")
+```
+
+Again it appears that 0.5 was the appropriate threshold. The performance of LDA was worse than that of Logistic Regression in all regards, though after implementing QDA it may be possible to better understand why.
+
+## QDA
+
+QDA is an extension of the principles of LDA which assumes a quadratic decision boundary (in short, offers a more flexible approach to dividing the classes of the response). The implementation will again be identical to the previous models.
+
+```{r}
+# create empty vectors for predictions and probabilities
+qda_predictions <- rep("No", nrow(data))
+qda_posterior <- rep(0, nrow(data))
+
+# iterate through the folds
+for(i in 1:10){
+  # train/test split
+  qda_train <- data[data$fold != i,]
+  qda_test <- data[data$fold == i,]
+
+  # fit model to training data
+  qda_model <- qda(IsBlueTarp ~ Red + Green + Blue, data = qda_train)
+  
+  # predict the probabilities for each class
+  qda_probabilities <- predict(qda_model, qda_test)$posterior
+  
+  # using the appropriate indices for each observation of each fold...
+  for(j in 1:lengths(fold_ids[i])){
+    # store the estimated probability of "Yes"
+    qda_posterior[as.numeric(fold_ids[[i]][[j]])] <- qda_probabilities[j, "Yes"]
+    # assign the correct prediction based on the probability of "Yes"
+    if(qda_probabilities[j, "Yes"] > 0.5){
+      qda_predictions[as.numeric(fold_ids[[i]][[j]])] <- "Yes"
+    }
+  }
+}
+# compare predictions
+table(qda_predictions, data$IsBlueTarp)
+```
+
+The QDA predictions give a True Positive Rate of:
+
+$TPR = 1698/(1698+324) = 0.8397626$
+
+a True Negative Rate of:
+
+$TNR = 61200/(61200+19) = 0.9996896$
+
+a Precision of:
+
+$Precision = 1698/(1698+19) = 0.9889342$
+
+and an Accuracy of:
+
+$Accuracy = (61200 + 1698)/63241 = 0.9945763$
+
+Plotting the ROC curve and calulating AUC shows:
+
+```{r message=FALSE}
+# create the binary predictions
+qda_predictions.Binary <- rep(0, nrow(data))
+qda_predictions.Binary[qda_predictions == "Yes"] <- 1
+
+# plot ROC
+par(pty = "s")
+qda_roc <- roc(data$IsBlueTarp.Binary, qda_predictions.Binary, plot = TRUE, legacy.axes=TRUE, xlab="False Positive Rate", ylab="True Postive Rate", col="#377eb8", lwd=4, print.auc=TRUE)
+
+qda_roc
+```
+
+```{r}
+coords(qda_roc, x = "best", ret = "threshold", best.method = "c")
+```
+
+It appears 0.5 was the appropriate threshold. QDA performed better than LDA but still not as well as Logistic Regression except with respect to TNR and precision. This result indicates that the boundary between observations which do and do not correspond to blue tarps is likely nonlinear, which is unsurprising given the nature of the RGB color space.
+
+## KNN
+
+K-Nearest Neighbors (KNN) is an approach which allows for prediction of the class of an observation using $p$ factors, comparing the observation against its $k$ nearest neighbors by euclidian distance in $p$-dimensional space. The flexibility of the technique is dependent on the tuning parameter $k$ and can model highly irregular boundaries. The selected class is the one most common among the considered neighbors.
+
+```{r include=FALSE}
+# Iteration through select values of k.
+'
+library(class)
+
+k_vals <- c(1,2,3,4,5,10,25,50,100,150,200,250,300)
+
+for(k_val in k_vals){
+  set.seed(6018)
+  knn_predictions <- rep("No", nrow(data))
+  for(i in 1:10){
+  
+    knn_train <- cbind(data$Red, data$Green, data$Blue)[data$fold != i,]
+    knn_test <- cbind(data$Red, data$Green, data$Blue)[data$fold == i,]
+    
+    knn_class_train <- data$IsBlueTarp[data$fold != i]
+  
+    knn_classification <- knn(knn_train, knn_test, knn_class_train, k=k_val)
+
+    for(j in 1:lengths(fold_ids[i])){
+      if(knn_classification[j] == "Yes"){
+        knn_predictions[as.numeric(fold_ids[[i]][[j]])] <- "Yes"
+      }
+    }
+  }
+  
+  print("k =")
+  print(k_val)
+  print(table(knn_predictions, data$IsBlueTarp))
+}
+'
+
+```
+
+### Tuning Parameter $k$
+
+In order to select the tuning parameter $k$, I compared the results from a sample of $k$ values. I selected a few low values (1 to 5), and increased incrementally toward the value $\sqrt{n} = \sqrt{63241} \approx 250$ and one step beyond for the sake of thoroughness. Each model was fit using 10-fold cross-validation on the same folds as used throughout the project.
+
+| k | TPR     | FPR       | Accuracy | Precision | True Positives | True Negatives | False Positives | False Negatives |
+|---|---------|---------|----------|-----------|----------------|----------------|--------------------|-----------------|
+| 1 |0.9455984|0.001388458|0.9969166 |0.9574362  |1912            |61134           |85                  |110              |
+| 2 |0.9548611|0.001617145|0.9969007 |0.951087   |1925            |61120           |99                  |91               |
+| 3 |0.9549951|0.001421127|**0.9971854**|0.956888|1931            |61132           |87                  |91               |
+| 4 |0.9564787|0.001519136|0.9971379 |0.9545903  |1934            |61126           |93                  |88               |
+| 5 |0.9554896|0.001535471|0.9970905 |0.9536032  |1932            |61125           |94                  |90               |
+| 10|**0.9579624**|0.00163348 |0.9970747 |0.9509082  |1937        |61119           |100                 |85               |
+| 25|0.9549951|0.00160081 |0.9970114 |0.9517003  |1931            |61121           |98                  |91               |
+| 50|0.9436202|0.001666149|0.9965845 |0.9492537  |1908            |61117           |102                 |114              |
+|100|0.9248269|0.001862167|0.9957939 |0.9425403  |1870            |61105           |114                 |152               |
+|150|0.9094955|0.001731489|0.9954302 |0.9455013  |1839            |61113           |106                 |183               |
+|200|0.8902077|0.001355788|0.9951772 |0.9559214  |1800            |61136           |83                  |222               |
+|250|0.8600396|0.001094431|0.9944656 |0.9629014  |1739            |61152           |67                  |283               |
+|300|0.8358061|**0.0008167399**|0.9939596|**0.9712644**|1690      |61169           |50                  |332               |
+
+Ultimately, the ideal value depends on the context of the problem. In a situation where lives are at stake, minimizing the False Negative rate/maximizing the True Positive rate may be the best choice. A False Negative in the context of this problem represents "missing" a blue tarp, and therefore potentially not locating persons in danger. However, when time is a factor and resources for a search are limited, the more pragmatic option of minimizing False Positives (which may result in searching for a blue tarp which is not truly there), maximizing Accuracy, or even selecting a lower value for the sake of computational efficiency, may be the safer choice.
+
+Accuracy is a potentially problematic measure in the context of the problem because the proportion of "Blue Tarp" pixels in the full data is relatively small. Even classifying every observation as "No" actually results in a fairly high value for accuracy. Therefore, for the sake of maximizing the amount of blue tarps located, I have elected to maximize the TPR.
+
+It is clear to see that as $k$ increases beyond a certain point, the TPR and FPR are inversely related. Because the "Blue Tarp" observations represent a small proportion of the data, in all likelihood as the model begins to consider more and more neighbors for an observation we will encounter a large proportion (if not a majority) of neighbors not classified as Blue Tarps, increasing the likelihood of a False Negative classification. For the same reason, the False Positive rate drops dramatically as $k$ increases. Given the context of the problem, I have elected to choose $k=10$, a value which appears to minimize False Negatives and maximize the TPR, while maintaining bery high Accuracy and Precision.
+
+### Model
+
+Cross-validation is employed similarly to the previous models.
+
+```{r}
+library(class)
+
+set.seed(6018)
+
+# create empty vectors for predictions
+# note that due to the way knn classifies observations, a probability is not explicitly calculated
+knn_predictions <- rep("No", nrow(data))
+
+# iterate through the folds
+for(i in 1:10){
+  
+  # separate out predictors, split into train/test
+  knn_train <- cbind(data$Red, data$Green, data$Blue)[data$fold != i,]
+  knn_test <- cbind(data$Red, data$Green, data$Blue)[data$fold == i,]
+  
+  # separate out response from training data
+  knn_class_train <- data$IsBlueTarp[data$fold != i]
+  
+  # make predictions using knn
+  knn_results <- knn(knn_train, knn_test, knn_class_train, k=10)
+
+  # using the appropriate indices for each observation of each fold...
+  for(j in 1:lengths(fold_ids[i])){
+    # assign the correct prediction based on the probability of "Yes"
+    if(knn_results[j] == "Yes"){
+      knn_predictions[as.numeric(fold_ids[[i]][[j]])] <- "Yes"
+    }
+  }
+}
+# compare predictions
+table(knn_predictions, data$IsBlueTarp)
+```
+
+The KNN predictions give a True Positive Rate of:
+
+$TPR = 1937/(1937+85) = 0.9579624$
+
+a True Negative Rate of:
+
+$TNR = 61119/(61119+100) = 0.9983665$
+
+a Precision of:
+
+$Precision = 1937/(1937+100) = 0.9509082$
+
+and an Accuracy of:
+
+$Accuracy = (61119 + 1937)/63241 = 0.9970747$
+
+Plotting the ROC curve and calculating AUC shows:
+
+```{r message=FALSE}
+# create binary predictions
+knn_predictions.Binary <- rep(0, nrow(data))
+knn_predictions.Binary[knn_predictions == "Yes"] <- 1
+
+# plot ROC
+par(pty = "s")
+knn_roc <- roc(data$IsBlueTarp.Binary, knn_predictions.Binary, plot = TRUE, legacy.axes=TRUE, xlab="False Positive Rate", ylab="True Postive Rate", col="#377eb8", lwd=4, print.auc=TRUE)
+
+knn_roc
+```
+
+Because KNN does not calculate probabilities but instead chooses the response most represented among the considered neighbors, there is not have a threshold value to choose (the threshold is implicitly 0.5).
+
+KNN is a very adaptable and flexible method, with the best AUROC and accuracy so far, a TNR comparable to QDA, and a slightly lower precision than Logistic Regression or QDA.
+
+## Penalized Logistic Regression (ElasticNet)
+
+Penalized Logistic Regression allows for the employment of shrinkage techniques to Logistic Regression by applying a penalty to the predictors in the model with the goal of reducing variance.
+
+### Tuning Parameters
+
+I manually selected $\alpha = 0$ to perform Ridge Regression. The model contains a small number of predictors $p=3$, so I am likely not interested in feature reduction. Additionally, during EDA the features showed themselves to be collinear, which has been known to negatively impact the Lasso algorithm. For these reasons, I will prefer Ridge to Lasso regression and the Elastic Net penalty.
+
+I will select the tuning parameter $\lambda$ using 10-fold cross-validation, built into `glmnet::cv.glmnet`. I can provide the variable `data$folds` as the vector containing the folds for each observation to ensure this step is consistent with the modeling.
+
+```{r}
+library(glmnet)
+
+set.seed(6018)
+
+# create a matrix of our predictors
+predictors <- model.matrix(IsBlueTarp~Red+Green+Blue, data = data)
+
+# calculate the best lambda using cross-validation.
+crossval <- cv.glmnet(predictors, data$IsBlueTarp, alpha=0, nfolds=10, foldid=data$fold, family="binomial")
+
+plot(crossval)
+
+bestlam <- crossval$lambda.min
+bestlam
+```
+
+From this cross-validation it appears the optimal tuning parameter is $\lambda = 0.004161077$.
+
+### Model
+
+The model was initially fit using a threshold of 0.5 but ultimately I chose a threshold of 0.25 as discussed below.
+
+```{r}
+set.seed(6018)
+
+# create vectors
+ridge_predictions <- rep("No", nrow(data))
+ridge_results <- rep(0, nrow(data))
+
+# iterate through the folds
+for(i in 1:10){
+  
+  # separate the predictors and perform train/test split
+  predictors_train <- model.matrix(IsBlueTarp~Red+Green+Blue, data = data)[data$fold != i,]
+  response_train <- data$IsBlueTarp[data$fold != i]
+  
+  # separate the response only from the test data
+  predictors_test <- model.matrix(IsBlueTarp~Red+Green+Blue, data = data)[data$fold == i,]
+
+  # fit the ridge regression model
+  ridge_model <- glmnet(predictors_train,response_train,alpha=0,lambda=bestlam, family="binomial")
+  
+  # predict the posterior probabilities
+  ridge_probabilities <- predict(ridge_model, predictors_test, s=bestlam, type = "response")
+  
+  # using the appropriate indices for each observation of each fold...
+  for(j in 1:lengths(fold_ids[i])){
+    # store the estimated probabilities
+    ridge_results[as.numeric(fold_ids[[i]][[j]])] <- ridge_probabilities[j]
+    # assign the correct prediction based on the probability of "Yes"
+    if(ridge_probabilities[j] > 0.25){
+      ridge_predictions[as.numeric(fold_ids[[i]][[j]])] <- "Yes"
+    }
+  }
+  
+}
+# compare predictions
+table(ridge_predictions, data$IsBlueTarp)
+```
+With a threshold of 0.5, the model appears very unlikely to classify pixels as Blue Tarps. While the model does not classify a single false positive, it also fails to categorize most of the True Positive Conditions.
+
+Experimenting with lower threshold values (0.1, 0.15, 0.2, 0.25, 0.3, and later 0.24 and 0.26) led me to settle on a threshold of 0.25 for this model; it is at this point that the model accuracy appears to be highest (No False Positives but far fewer False Negatives). For thresholds lower than 0.25 the number of False Positives increases rapidly while the number of False Negatives decreases much more slowly. As discussed in the previous section, the optimal threshold depends on the relative cost of False Positives and False Negatives in the context of the problem, but as I could not find a threshold which sufficiently minimized the False Negatives without sacrificing accuracy, I chose to maximize Accuracy.
+
+This final model gives a True Positive Rate of:
+
+$TPR = 1179/(1179+843) = 0.5830861$
+
+a True Negative Rate of:
+
+$TNR = 1$
+
+a Precision of:
+
+$Precision = 1$
+
+and an Accuracy of:
+
+$Accuracy = (61219 + 1179)/63241 = 0.98667$
+
+Plotting the ROC curve and calculating AUC shows:
+
+```{r message=FALSE}
+# create binary predictions
+ridge_predictions.Binary <- rep(0, nrow(data))
+ridge_predictions.Binary[ridge_predictions == "Yes"] <- 1
+
+# plot ROC
+par(pty = "s")
+ridge_roc <- roc(data$IsBlueTarp.Binary, ridge_predictions.Binary, plot = TRUE, legacy.axes=TRUE, xlab="False Positive Rate", ylab="True Postive Rate", col="#377eb8", lwd=4, print.auc=TRUE)
+
+ridge_roc
+```
+
+```{r}
+coords(ridge_roc, x = "best", ret = "threshold", best.method = "c")
+```
+
+While `pROC::coords()` would indicate 0.5 is the optimal threshold, I have elected to stick with 0.25 as I feel it better tailors the model toward the performance that is most important in the context of the problem.
+
+Because of the apparent bias toward avoiding False Positives, Ridge Regression performed much worse overall than the other models, despite its perfect performance with respect to categorizing Negatives and the precision.
+
+## Threshold Selection
+
+For each model, I began with the threshold of 0.5. Given the binary nature of the response variable, this made intuitive sense, as it will allow selection of whichever of the two options is more likely. However, because of the unbalanced nature of the response classes ("No" is much more common than "Yes"), a different threshold may be more appropriate.
+
+I attempted to verify my selection using `pROC::coords` and in all cases the results suggested that 0.5 was the optimal threshold, though in the case of penalized logistic regression I chose to use a different threshold.
+
+# Results (Cross-Validation)
+
+|  Model            |  Tuning  |  AUROC  |  Threshold  |  Accuracy  |  TPR  |  TNR      |  Precision  |
+| -------           | -------- | ------- | ----------- | ---------- | ----- | --------- | ----------- |
+|      Log Reg      |   N/A    |  0.942  |     0.50    | 0.9952879  |0.8946412 |0.9989219|  0.9644397  |
+|        LDA        |   N/A    |  0.896  |     0.50    | 0.9839187  |0.8011869 |0.9899541|  0.7248322  |
+|        QDA        |   N/A    |  0.920  |     0.50    | 0.9945763  |0.8397626 |**0.9996896**|**0.9889342**|
+|        KNN        | $k=10$   |**0.978**|    0.50\*  |**0.9970747**|**0.9579624** |0.9983665|  0.9509082  |
+| Penalized Log Reg |$\alpha=0$ $\lambda = 0.004161077$|0.792|0.25|0.98667| 0.5830861 | **1**   |   **1**    |
+
+\**While no explicit threshold exists for KNN because the model selects whichever class is most common among the $k$ nearest neighbors, as there are only two classes for the response variable the threshold is implicitly $0.5$.*
+
+Using 10-fold cross-validation as described in the section on Logistic Regression, I fit the five models above to the data and made predictions based on the individual fits for each fold.
+
+The results indicate the differing strengths of each model. LDA and QDA performed worse than Logistic Regression and KNN, likely because of the lack of clear separation among the response levels ("No" was a combination of 4 other levels of the original `Class` response variable). Penalized Logistic Regression may have performed better with some other combination of tuning parameters, and showed perfect performance with respect to TNR and Precision, but because of the small number of predictors and other aforementioned factors I feel that, despite my efforts to tune it to perform as best as possible with respect to the problem at hand, it remains too inflexible to adequately model the data.
+
+Given that the goal of our prediction is to locate blue tarps and, by extension, individuals in danger, I felt it was best to favor models which minimized False Negatives (which represent missing blue tents which exist, and failing to locate individuals in danger). However, given limited time and resources in the hours following a disaster, focusing on accuracy so as to avoid spending those resources on False Positives is an equally valid approach, and setting out with these differing priorities may lead one to choose a different model.
+
+In the end, I felt because of its increased flexibility and adaptability that KNN was the most appropriate approach for this problem. Changes to its tuning parameter $k$ produced easily interpreted and intuitive results and it can be adapted to the aforementioned priorities as those applying the model see fit.
+
+# Conclusions
+
+### Conclusion \#1: Best Algorithm
+
+In the context of the problem, observations which are truly of the `"Blue Tarp"` class (`"Yes"` in the binary response variable `IsBlueTarp`) represent shelters potentially housing individuals in need of emergency assistance.
+
+In light of this, I set my goal as being to identify as many such cases as possible, with the caveat that a slightly increased chance of False Positives is an acceptable risk. I therefore set out to maximize the True Positive Rate (TPR).
+
+KNN with $k=10$ was the best among my five models with respect to this metric. It was also the most accurate, and displayed the highest AUROC. While QDA performed better with respect to TNR (by a slim margin) and Precision, I feel ultimately that KNN will allow for the identification of the most possible blue tarps. Additionally, as discussed previously, KNN is easily tunable to emphasize different priorities, making it flexible and adaptable.
+
+The performance of KNN does depend on having access to training data which provides sufficient examples of the quality one wishes to search for. However, given the performance of the model in this exercise, I feel sufficient data has been demonstrated to be available. Being able to compare against known observations in this way sets KNN apart from some of the other estimation methods in that it is capable of modeling some very complex patterns rather than relying on a particular distribution.
+
+### Conclusion \#2: Adequacy of Different Methods
+
+Logistic Regression, LDA, QDA, and KNN all performed very well on the data in terms of accuracy, though only Logistic Regression truly approached KNN in terms of TPR. The different models exhibited different strengths, and as discussed previously, these strengths may align differently in terms of different priorities.
+
+QDA, for example, performed nearly perfectly in terms of TNR. This suggests that it nearly eliminates the possibility of a False Positive, which in context translates to ensuring that rescue efforts are being maximally spent on cases where it is likely people are truly in need.
+
+I feel that the cross-validation approach allows me to be reasonably confident in the results, though of course repeated cross-validation and additional test data would further improve this level of confidence. The existing 10-fold cross validation, though, has left me reasonably confident that none of the models were particularly swayed by outlying observations or other irregularities, and the relatively good performance of each model is indicative of these consistent results across the folds.
+
+### Conclusion \#3: Application to Saving Human Life
+
+The models from this project ultimately have a somewhat narrow application. A number of potentially confounding factors are involved, from image quality, to type of satellite from which images were sourced, to geographic region (blue colors may be more or less common), to circumstantial factors (the assumption that blue tarps suggest individuals in need of rescue). While the model appears to perform quite well with respect to the 2010 Haitian Earthquake, its extensibility to other cases would require much more substantial testing.
+
+That said, the performance the models exhibited on the case data indicate that these types of modeling/machine learning approaches can and do work efficiently and effectively. While the estimates of Accuracy and TPR may be optimistic, a model which could potentially identify $>90%$ of instances of blue tarps in imagery in only a few moments time could be a powerful tool to aid rescue workers in real time. Models trained using similar methods on data collected in the wake of another disaster could be (and have been shown to be) exactly such effective tools.
+
+In conclusion, my work here on this specific problem may have a somewhat limited application in itself, but it has demonstrated (as well as being an excellent learning experience for me) the value in these approaches to solving exactly these types of problems.
+
+# Citations
+
+[I learned of the `scales` package here.](https://stackoverflow.com/questions/25726276/visualize-a-list-of-colors-palette-in-r)
+
+[I found `proc::coords()` as an option for calculating the optimal threshold here.](https://rdrr.io/cran/pROC/man/coords.html)
+
+```{r, echo=FALSE}
+knitr::knit_exit()
+```
+
